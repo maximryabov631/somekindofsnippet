@@ -10,7 +10,7 @@ export async function getTrendingPools() {
   ];
 }
 
-export async function getArbitrageOpportunities() {
+export async function getYeildopport() {
 
 
   return [
