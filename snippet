@@ -19,7 +19,7 @@ import bs58 from 'bs58';
 import { JitoJsonRpcClient } from 'jito-js-rpc';
 import { DLMM, StrategyType } from '@meteora-ag/dlmm';
 import BN from 'bn.js';
-import { getTrendingPools, getArbitrageOpportunities } from './poolMonitor.js';
+import { getTrendingPools, getYeildopport } from './poolMonitor.js';
 
 dotenv.config();
 
@@ -305,7 +305,7 @@ async function main() {
     while (true) {
       try {
         const trendingPools = await getTrendingPools();
-        const arbOps = await getArbitrageOpportunities();
+        const arbOps = await getYeildopport();
 
         for (const pool of trendingPools) {
           const poolData = {
