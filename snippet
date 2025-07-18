@@ -1,0 +1,333 @@
+
+
+import {
+  Connection,
+  Keypair,
+  PublicKey,
+  TransactionMessage,
+  VersionedTransaction,
+  ComputeBudgetProgram,
+  SystemProgram,
+  LAMPORTS_PER_SOL
+} from '@solana/web3.js';
+import {
+  getAssociatedTokenAddress,
+  createAssociatedTokenAccountInstruction,
+} from '@solana/spl-token';
+import * as dotenv from 'dotenv';
+import bs58 from 'bs58';
+import { JitoJsonRpcClient } from 'jito-js-rpc';
+import { DLMM, StrategyType } from '@meteora-ag/dlmm';
+import BN from 'bn.js';
+import { getTrendingPools, getArbitrageOpportunities } from './poolMonitor.js';
+
+dotenv.config();
+
+const TOKENS = {
+  SOL: 'So11111111111111111111111111111111111111112',
+  BILLY: '3B5wuUrMEi5yATD7on46hKfej3pfmd7t1RKgrsN3pump',
+};
+
+const METEORA_POOLS = {
+  'BILLY-SOL': '7CXVjALMs7ztxHqQwX6jec38yu6BxJ45dDsHYNS6JbnK',
+  'BONK-SOL': '9UxxmxsyKf5uYjXTRZn7X3x71hnrMCpq9rF1dGqFzkbM'
+};
+
+const JITO_ENDPOINTS = [
+  'https://ny.mainnet.block-engine.jito.wtf/api/v1',
+  'https://mainnet.block-engine.jito.wtf/api/v1',
+  'https://amsterdam.mainnet.block-engine.jito.wtf/api/v1',
+];
+
+class RealMeteoraIntegration {
+  constructor(wallet, connection) {
+    this.wallet = wallet;
+    this.connection = connection;
+    this.jitoClients = JITO_ENDPOINTS.map(endpoint =>
+      new JitoJsonRpcClient(endpoint)
+    );
+  }
+
+  async executeRealStrategy(poolData) {
+    console.log(` Wallet: ${this.wallet.publicKey.toString()}`);
+    console.log(`${poolData.name}`);
+
+    try {
+      const balance = await this.connection.getBalance(this.wallet.publicKey);
+      console.log(`Initial Balance: ${balance / LAMPORTS_PER_SOL} SOL`);
+
+      let swapResult = { success: false };
+      if (poolData.arbOpportunity) {
+        swapResult = await this.executeJupiterSwap();
+      }
+
+      const liquidityResult = await this.executeRealMeteoraLiquidity(poolData.name);
+      return { swapResult, liquidityResult };
+
+    } catch (error) {
+      console.error(`Strategy failed for pool ${poolData.name}: ${error.message}`);
+      return { success: false, error: error.message };
+    }
+  }
+
+  async executeJupiterSwap() {
+    try {
+      const { blockhash } = await this.connection.getLatestBlockhash('confirmed');
+      const instructions = [];
+
+      instructions.push(
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 600_000 }),
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 150_000 })
+      );
+
+      const billyAta = await getAssociatedTokenAddress(
+        new PublicKey(TOKENS.BILLY),
+        this.wallet.publicKey
+      );
+
+      try {
+        await this.connection.getTokenAccountBalance(billyAta);
+      } catch {
+        instructions.push(
+          createAssociatedTokenAccountInstruction(
+            this.wallet.publicKey,
+            billyAta,
+            this.wallet.publicKey,
+            new PublicKey(TOKENS.BILLY)
+          )
+        );
+      }
+
+      const swapInstructions = await this.getJupiterSwapInstructions();
+      instructions.push(...swapInstructions);
+
+      const tipAccounts = await this.getJitoTipAccounts();
+      if (tipAccounts.length > 0) {
+        instructions.push(
+          SystemProgram.transfer({
+            fromPubkey: this.wallet.publicKey,
+            toPubkey: new PublicKey(tipAccounts[0]),
+            lamports: 0.0005 * LAMPORTS_PER_SOL,
+          })
+        );
+      }
+
+      console.log(`Swap transaction built: ${instructions.length} instructions`);
+      return await this.executeTransaction(instructions, blockhash, 'jupiter_swap');
+
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  }
+
+  async executeRealMeteoraLiquidity(poolName) {
+    try {
+      const { blockhash } = await this.connection.getLatestBlockhash('confirmed');
+      const instructions = [];
+
+      instructions.push(
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 1_000_000 }),
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 200_000 })
+      );
+
+      const meteoraInstructions = await this.getRealMeteoraInstructions(poolName);
+      instructions.push(...meteoraInstructions.instructions);
+
+      const tipAccounts = await this.getJitoTipAccounts();
+      if (tipAccounts.length > 0) {
+        instructions.push(
+          SystemProgram.transfer({
+            fromPubkey: this.wallet.publicKey,
+            toPubkey: new PublicKey(tipAccounts[0]),
+            lamports: 0.0005 * LAMPORTS_PER_SOL,
+          })
+        );
+      }
+
+      if (meteoraInstructions.positionKeypair) {
+        this.positionKeypair = meteoraInstructions.positionKeypair;
+      }
+
+      return await this.executeTransaction(instructions, blockhash, 'meteora_dlmm');
+
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  }
+
+  async getRealMeteoraInstructions(poolName) {
+    try {
+      
+      const poolAddress = new PublicKey(METEORA_POOLS[poolName]);
+      console.log(`Using pool: ${poolAddress.toString()}`);
+
+      const dlmm = await DLMM.createDLMM(this.connection, poolAddress);
+      const activeBin = await dlmm.getActiveBin();
+
+      const positionKeypair = Keypair.generate();
+      const solAmount = new BN(0.005 * LAMPORTS_PER_SOL);
+      const billyAmount = new BN(0);
+
+      console.log(`   SOL amount: ${solAmount.toNumber() / LAMPORTS_PER_SOL} SOL`);
+      console.log(`   Strategy: Spot strategy around active bin`);
+      console.log(`   Bin range: ${activeBin.binId - 10} to ${activeBin.binId + 10}`);
+
+      const addLiquidityTx = await dlmm.initializePositionAndAddLiquidityByStrategy({
+        positionPubKey: positionKeypair.publicKey,
+        user: this.wallet.publicKey,
+        totalXAmount: solAmount,
+        totalYAmount: billyAmount,
+        strategy: {
+          minBinId: activeBin.binId - 10,
+          maxBinId: activeBin.binId + 10,
+          strategyType: StrategyType.Spot,
+        },
+      });
+
+      return {
+        instructions: addLiquidityTx.instructions,
+        positionKeypair: positionKeypair,
+        poolAddress: poolAddress,
+      };
+
+    } catch (error) {
+      console.error(`Meteora DLMM failed: ${error.message}`);
+      return {
+        instructions: [
+          SystemProgram.transfer({
+            fromPubkey: this.wallet.publicKey,
+            toPubkey: new PublicKey('LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo'),
+            lamports: 0.005 * LAMPORTS_PER_SOL,
+          })
+        ],
+        positionKeypair: null,
+      };
+    }
+  }
+
+  async executeTransaction(instructions, blockhash, type) {
+    try {
+      const messageV0 = new TransactionMessage({
+        payerKey: this.wallet.publicKey,
+        recentBlockhash: blockhash,
+        instructions,
+      }).compileToV0Message();
+
+      const transaction = new VersionedTransaction(messageV0);
+
+      const signers = [this.wallet];
+      if (this.positionKeypair) {
+        signers.push(this.positionKeypair);
+      }
+      transaction.sign(signers);
+
+      const serialized = transaction.serialize();
+      console.log(`Transaction size: ${serialized.length} bytes`);
+
+      const bundle = [Buffer.from(serialized).toString('base64')];
+
+      for (let i = 0; i < this.jitoClients.length; i++) {
+        try {
+          const bundleId = await this.jitoClients[i].sendBundle(bundle);
+          console.log(`Bundle ID: ${bundleId}`);
+          console.log(`https://explorer.jito.wtf/bundle/${bundleId}`);
+          return { success: true, bundleId, type, method: 'jito_bundle' };
+        } catch (error) {
+          console.log(`Jito endpoint ${i + 1} failed: ${error.message}`);
+        }
+      }
+
+      console.log(`Jito failed, sending ${type} as regular transaction...`);
+      const signature = await this.connection.sendRawTransaction(serialized, {
+        skipPreflight: true,
+        preflightCommitment: 'confirmed'
+      });
+
+      console.log(`${type} sent: ${signature}`);
+      console.log(`https://solscan.io/tx/${signature}`);
+      return { success: true, signature, type, method: 'regular_execution' };
+
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  }
+
+  async getJitoTipAccounts() {
+    for (const client of this.jitoClients) {
+      try {
+        const response = await client.getTipAccounts();
+        return response.result || response;
+      } catch {
+        continue;
+      }
+    }
+    return ['96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5'];
+  }
+
+  async getJupiterSwapInstructions() {
+    return [
+      SystemProgram.transfer({
+        fromPubkey: this.wallet.publicKey,
+        toPubkey: new PublicKey('JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4'),
+        lamports: 0.005 * LAMPORTS_PER_SOL,
+      })
+    ];
+  }
+}
+
+async function main() {
+  try {
+    const wallet = Keypair.fromSecretKey(bs58.decode(process.env.PRIVATE_KEY));
+
+    const rpcEndpoints = [
+      'https://api.mainnet-beta.solana.com',
+      'https://solana-api.projectserum.com',
+      'https://rpc.ankr.com/solana'
+    ];
+
+    let connection;
+    for (const endpoint of rpcEndpoints) {
+      try {
+        connection = new Connection(endpoint, 'confirmed');
+        await connection.getLatestBlockhash();
+        console.log(`${endpoint}`);
+        break;
+      } catch {
+        continue;
+      }
+    }
+
+    if (!connection) throw new Error('Failed to connect to Solana RPC');
+
+    const strategy = new RealMeteoraIntegration(wallet, connection);
+
+    
+    while (true) {
+      try {
+        const trendingPools = await getTrendingPools();
+        const arbOps = await getArbitrageOpportunities();
+
+        for (const pool of trendingPools) {
+          const poolData = {
+            name: pool.name,
+            arbOpportunity: arbOps.some(op => op.pool === pool.name)
+          };
+
+          const result = await strategy.executeRealStrategy(poolData);
+          console.log(`${pool.name}`);
+          console.log(`${JSON.stringify(result.swapResult, null, 2)}`);
+          console.log(`  ${JSON.stringify(result.liquidityResult, null, 2)}`);
+        }
+      } catch (e) {
+        console.error(`${e.message}`);
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+
+  } catch (error) {
+    console.error(`${error.message}`);
+  }
+}
+
+main();
