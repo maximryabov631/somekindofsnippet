@@ -1,0 +1,19 @@
+// poolMonitor.js
+
+
+export async function getTrendingPools() {
+
+
+  return [
+    { name: 'BILLY-SOL' },
+    { name: 'BONK-SOL' }
+  ];
+}
+
+export async function getArbitrageOpportunities() {
+
+
+  return [
+    { pool: 'BILLY-SOL', profit: 0.12 }
+  ];
+}
